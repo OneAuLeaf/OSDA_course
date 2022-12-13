@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple, FrozenSet, Set, Dict
+from typing import List, Tuple, FrozenSet, Set, Dict, Optional, Callable, Any
 import pandas as pd
 
 from fcapy.lattice import ConceptLattice
@@ -8,6 +8,7 @@ from fcapy.poset import POSet
 from fcapy.visualizer.line_layouts import calc_levels
 
 import torch
+import torch.nn.functional as F
 from sparselinear import SparseLinear
 
 
@@ -82,26 +83,75 @@ class ConceptNetwork:
     def fit(
             self,
             X_df: 'pd.DataFrame[bool]', y: 'pd.Series[bool]',
+            eval_X : Optional['pd.DataFrame[bool]'] = None, eval_y: Optional['pd.Series[bool]'] = None,
+            eval_metric : Optional[Callable[[Any], float]] = None,
             loss_fn=torch.nn.CrossEntropyLoss(), nonlinearity=torch.nn.ReLU,
-            n_epochs: int = 2000
-    ):
+            n_epochs: int = 2000,
+            lr : float = 1e-3,
+    ) -> Dict:
         X = torch.tensor(X_df[list(self.attributes)].values).float()
         y = torch.tensor(y.values).long()
 
         self._network = self._poset_to_network(self.poset, nonlinearity)
 
-        optimizer = torch.optim.Adam(self.network.parameters())
+        optimizer = torch.optim.Adam(self.network.parameters(), lr=lr)
 
-        for t in range(n_epochs):
+        eval_flag = eval_X is not None and eval_y is not None
+        eval_metric_flag = eval_metric is not None
+        history = {
+            'train': {
+                'loss': []
+            },
+        }
+        if eval_metric_flag:
+            history['train']['metric'] = []
+        if eval_flag:
+            eval_X = torch.tensor(eval_X[list(self.attributes)].values).float()
+            eval_y = torch.tensor(eval_y.values).long()
+
+            if eval_metric_flag:
+                history['eval'] = {'loss': [], 'metric': []}
+            else:
+                history['eval'] = {'loss': [], }
+
+        
+        for _ in range(n_epochs):
+            self.network.train()
+
             optimizer.zero_grad()
             y_pred = self.network(X)
             loss = loss_fn(y_pred, y)
             loss.backward()
             optimizer.step()
 
+            history['train']['loss'].append(loss.item())
+
+            if eval_metric_flag:
+                y_pred_v = y_pred.argmax(1)
+                score = eval_metric(y, y_pred_v)
+                history['train']['metric'].append(score)
+    
+            if eval_flag:
+                self.network.eval()
+                with torch.no_grad():
+                    y_eval_pred = self.network(eval_X)
+                    y_eval_pred_v = y_eval_pred.argmax(1)
+                    loss = loss_fn(y_eval_pred, eval_y)
+                    history['eval']['loss'].append(loss.item())
+                    if eval_metric_flag:
+                        score = eval_metric(eval_y, y_eval_pred_v)
+                        history['eval']['metric'].append(score)
+        return history
+
+
     def predict_proba(self, X_df: 'pd.DataFrame[bool]') -> torch.Tensor:
         X = torch.tensor(X_df[list(self.attributes)].values).float()
-        return self.network(X)
+        
+        self.network.eval()
+        with torch.no_grad():
+            logits = self.network(X)
+            y_pred_prob = F.softmax(logits, dim=1)
+        return y_pred_prob
 
     def predict(self, X_df: 'pd.DataFrame[bool]') -> torch.Tensor:
         return self.predict_proba(X_df).argmax(1)
@@ -176,7 +226,7 @@ class ConceptNetwork:
             layer = SparseLinear(len(nodes_per_levels[layer_i]), len(nodes_per_levels[layer_i + 1]), connectivity=con)
             linear_layers.append(layer)
 
-        layers = [layer for ll in linear_layers for layer in [ll, nonlinearity()]][:-1] + [torch.nn.Softmax(dim=1)]
+        layers = [layer for ll in linear_layers for layer in [ll, nonlinearity()]][:-1]
         model_sparse = torch.nn.Sequential(*layers)
         return model_sparse
 
